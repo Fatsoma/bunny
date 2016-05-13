@@ -12,18 +12,74 @@ module Bunny
     READ_RETRY_EXCEPTION_CLASSES = [Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitReadable]
     WRITE_RETRY_EXCEPTION_CLASSES = [Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitWritable]
 
-    def self.open(host, port, options = {})
-      socket = ::Socket.tcp(host, port, nil, nil,
-                            connect_timeout: options[:connect_timeout])
-      if ::Socket.constants.include?('TCP_NODELAY') || ::Socket.constants.include?(:TCP_NODELAY)
-        socket.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, true)
+    class << self
+      def open(host, port, options = {})
+        socket = open_socket(host, port, options)
+        socket.extend self
+        socket.options = { :host => host, :port => port }.merge(options)
+        socket
+      rescue Errno::ETIMEDOUT
+        raise ClientTimeout
       end
-      socket.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_KEEPALIVE, true) if options.fetch(:keepalive, true)
-      socket.extend self
-      socket.options = { :host => host, :port => port }.merge(options)
-      socket
-    rescue Errno::ETIMEDOUT
-      raise ClientTimeout
+
+      # Open a socket to given host and port
+      #
+      # Will timeout after options[:connect_timeout] for each address resolved
+      #
+      # @api private
+      def open_socket(host, port, options = {})
+        last_error = nil
+        ret = nil
+        Addrinfo.foreach(host, port, nil, ::Socket::SOCK_STREAM) do |addr|
+          begin
+            socket = connect_to_address(addr, options)
+          rescue SystemCallError => e
+            last_error = e
+            next
+          end
+          ret = socket
+          break
+        end
+        unless ret
+          if last_error
+            raise last_error
+          else
+            raise ::SocketError, 'no appropriate local address'
+          end
+        end
+        ret
+      end
+
+      # Open a socket to given address info using IO.select to timeout
+      #
+      # @api private
+      def connect_to_address(addr, options = {})
+        socket = ::Socket.new(addr.afamily, ::Socket::SOCK_STREAM)
+
+        if ::Socket.constants.include?('TCP_NODELAY') || ::Socket.constants.include?(:TCP_NODELAY)
+          socket.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, true)
+        end
+        socket.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_KEEPALIVE, true) if options.fetch(:keepalive, true)
+
+        begin
+          socket.connect_nonblock(addr)
+        rescue IO::WaitWritable
+          if IO.select(nil, [socket], nil, options[:connect_timeout])
+            begin
+              socket.connect_nonblock(addr)
+            rescue Errno::EISCONN
+              return socket
+            rescue
+              socket.close
+              raise
+            end
+          else
+            socket.close
+            raise ConnectionTimeout
+          end
+        end
+        socket
+      end
     end
 
     # Reads given number of bytes with an optional timeout
